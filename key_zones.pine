@@ -1,0 +1,601 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// https://mozilla.org/MPL/2.0/
+//@version=6
+indicator("Session reference zones", overlay = true, max_boxes_count = 24, max_lines_count = 24, max_labels_count = 24, dynamic_requests = true)
+
+const string TZ = "America/New_York"
+const int MINUTE_MS = 60000
+const int MAX_MANUAL = 12
+const int MAX_EVENTS = 24
+const int MAX_OVERRIDES = 48
+const int CALENDAR_YEAR = 2026
+const int LINE_STRENGTH_OPACITY = 8
+const int FILL_STRENGTH_OPACITY = 5
+const int DIRECTIONAL_LINE_FADE = 25
+const int DIRECTIONAL_FILL_FADE = 5
+const int TABLE_FRAME_TRANSPARENCY = 70
+const string CASH_CALENDAR = "20260101=0000;20260119=0000;20260216=0000;20260403=0000;20260525=0000;20260619=0000;20260703=0000;20260907=0000;20261126=0000;20261127=1300;20261224=1300;20261225=0000"
+const string ALL_TF = "1,5,10,15,60,240"
+const string G_DATA = "Data and sessions"
+const string G_MODEL = "Volatility and directionality"
+const string G_REFS = "Session references"
+const string G_OPTIONS = "Manual options references"
+const string G_EVENTS = "Scheduled events"
+const string G_ZONES = "Zones and filtering"
+const string G_STYLE = "Appearance"
+const string G_ALERT = "Alerts"
+
+string sourceInput = input.symbol("", "Source contract", group = G_DATA, tooltip = "Blank: chart contract; continuous charts use their CURRENT dated contract. For historical replay select the dated contract explicitly.")
+int sourceBars = input.int(100000, "Source minutes", minval = 10000, maxval = 100000, step = 10000, group = G_DATA, tooltip = "Requested one-minute bars. Coverage also depends on your plan and data feed.")
+string globexSession = input.session("1800-1700", "Globex", group = G_DATA, tooltip = "New York time. Default includes the 17:00–18:00 maintenance break.")
+string cashSession = input.session("0930-1600", "Cash reference", group = G_DATA, tooltip = "New York time, Monday–Friday. Used as a reference session for futures.")
+string cashOverrides = input.text_area(CASH_CALENDAR, "Cash close overrides", group = G_DATA, tooltip = "YYYYMMDD=HHMM; New York dates. 0000 means closed. Default: verified 2026 Nasdaq cash calendar only. Update other years and exchange changes.")
+string futuresOverrides = input.text_area("", "Futures close overrides", group = G_DATA, tooltip = "YYYYMMDD=HHMM; New York dates. A close applies until the next Globex opening; 0000 means closed until that opening.")
+int resetAt = input.time(0, "Manual state reset", group = G_DATA, tooltip = "Optional timestamp. Clears carried references and volatility; requires a new warmup. Zero disables.")
+string volMethod = input.string("Rogers–Satchell", "Variance estimator", options = ["Rogers–Satchell", "Parkinson", "Close return"], group = G_MODEL)
+int volLength = input.int(20, "Variance lookback", minval = 5, maxval = 60, group = G_MODEL, tooltip = "Arithmetic mean of this many complete cash-session variances. Not a calibrated reversal probability.")
+int regimeMinutes = input.int(60, "Directionality warmup", minval = 15, maxval = 240, group = G_MODEL, tooltip = "Complete one-minute cash bars.")
+float lowEfficiency = input.float(0.10, "Low efficiency", minval = 0, maxval = 0.5, step = 0.01, group = G_MODEL)
+float highEfficiency = input.float(0.25, "High efficiency", minval = 0.1, maxval = 1, step = 0.01, group = G_MODEL)
+string dealerRegime = input.string("Unknown", "Dealer gamma (manual)", options = ["Unknown", "Positive", "Negative"], group = G_MODEL, tooltip = "External assessment; never inferred from open interest or the pasted price list.")
+bool showPrior = input.bool(true, "Prior cash H/L/close", group = G_REFS)
+string priorTf = input.string(ALL_TF, "Prior timeframes", group = G_REFS, tooltip = "Comma-separated minute periods: 1,5,10,15,60,240.")
+bool showOvernight = input.bool(true, "Completed overnight H/L", group = G_REFS)
+string overnightTf = input.string(ALL_TF, "Overnight timeframes", group = G_REFS)
+bool showOpening = input.bool(true, "Completed opening range", group = G_REFS)
+int openingMinutes = input.int(30, "Opening range minutes", minval = 5, maxval = 120, group = G_REFS)
+string openingTf = input.string(ALL_TF, "Opening timeframes", group = G_REFS)
+bool showVwap = input.bool(true, "Cash VWAP", group = G_REFS)
+bool showPriorVwap = input.bool(false, "Prior cash VWAP", group = G_REFS)
+string vwapTf = input.string(ALL_TF, "VWAP timeframes", group = G_REFS)
+bool hideDirectionalVwap = input.bool(false, "Hide isolated VWAP in directional state", group = G_REFS)
+bool showOptions = input.bool(true, "Show manual references", group = G_OPTIONS)
+string manualText = input.text_area("", "Levels", group = G_OPTIONS, tooltip = "CW:price; PW:price; ZG:price; PIN:price. Semicolons or newlines. At most 12 entries. No thousands separators. These are references, not measured dealer exposures.")
+string optionUnits = input.string("Native", "Quoted underlying", options = ["Native", "NDX / index", "QQQ / ETF"], group = G_OPTIONS)
+string indexSymbol = input.symbol("NASDAQ:NDX", "Cash index", group = G_OPTIONS, tooltip = "NQ/MNQ: NDX. For ES/MES conversion use the matching index, e.g. SP:SPX.")
+string etfSymbol = input.symbol("NASDAQ:QQQ", "ETF", group = G_OPTIONS, tooltip = "NQ/MNQ: QQQ. For ES/MES conversion use the matching ETF, e.g. AMEX:SPY.")
+string conversionMode = input.string("Freeze first cash match", "Conversion", options = ["Freeze first cash match", "Update each cash minute"], group = G_OPTIONS, tooltip = "Uses synchronized one-minute futures/index/ETF closes. Both modes freeze outside cash hours; the second intentionally moves converted zones.")
+float mappingHours = input.float(24, "Mapping maximum age", minval = 1, maxval = 72, group = G_OPTIONS, tooltip = "Hours since the last synchronized observation. Older converted levels are hidden.")
+string optionsTf = input.string(ALL_TF, "Options timeframes", group = G_OPTIONS)
+string eventText = input.text_area("", "Event times", group = G_EVENTS, tooltip = "YYYYMMDD-HHMM in New York time; semicolons or newlines. At most 24. Manual calendar only; no automatic earnings or macro feed.")
+int minutesBefore = input.int(15, "Minutes before", minval = 0, maxval = 120, group = G_EVENTS)
+int minutesAfter = input.int(30, "Minutes after", minval = 0, maxval = 240, group = G_EVENTS)
+bool muteEvents = input.bool(true, "Mute alerts in event window", group = G_EVENTS)
+float halfWidthSigma = input.float(0.015, "Half-width / sigma", minval = 0.001, maxval = 0.1, step = 0.001, group = G_ZONES)
+float mergeSigma = input.float(0.03, "Merge distance / sigma", minval = 0, maxval = 0.3, step = 0.005, group = G_ZONES)
+float maximumWidthSigma = input.float(0.08, "Maximum full width / sigma", minval = 0.01, maxval = 0.5, step = 0.01, group = G_ZONES)
+float distanceSigma = input.float(3, "Maximum distance / sigma", minval = 0.25, maxval = 10, step = 0.25, group = G_ZONES)
+int minimumStrength = input.int(1, "Minimum family count", minval = 1, maxval = 3, group = G_ZONES, tooltip = "Distinct reference, benchmark and manual-options families. Not a probability or significance score.")
+int maximumZones = input.int(8, "Maximum zones", minval = 1, maxval = 24, group = G_ZONES)
+color referenceColor = input.color(color.rgb(62, 125, 184), "Reference", group = G_STYLE)
+color benchmarkColor = input.color(color.rgb(29, 151, 130), "Benchmark", group = G_STYLE)
+color optionsColor = input.color(color.rgb(174, 120, 47), "Options / confluence", group = G_STYLE)
+int fillOpacity = input.int(12, "Fill opacity %", minval = 0, maxval = 100, group = G_STYLE)
+int lineOpacity = input.int(75, "Line opacity %", minval = 0, maxval = 100, group = G_STYLE)
+string lineStyleInput = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = G_STYLE)
+int lineWidth = input.int(1, "Base line width", minval = 1, maxval = 3, group = G_STYLE)
+string extensionInput = input.string("Right", "Extension", options = ["Right", "Both", "None"], group = G_STYLE)
+int historyMinutes = input.int(120, "Drawing span (minutes)", minval = 1, maxval = 1440, group = G_STYLE, tooltip = "Current map only; drawings back to this time are NOT historical signals.")
+bool showLabels = input.bool(true, "Labels", group = G_STYLE)
+string labelSizeInput = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = G_STYLE)
+string labelSide = input.string("Right", "Label side", options = ["Right", "Left"], group = G_STYLE)
+int labelOffset = input.int(5, "Label offset (minutes)", minval = 0, maxval = 120, group = G_STYLE)
+bool showTable = input.bool(true, "Info table", group = G_STYLE)
+string tablePosition = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = G_STYLE)
+bool enableAlerts = input.bool(false, "Enable entry alerts", group = G_ALERT)
+int alertStrength = input.int(2, "Minimum alert family count", minval = 1, maxval = 3, group = G_ALERT)
+int alertCooldown = input.int(10, "Global cooldown (minutes)", minval = 1, maxval = 120, group = G_ALERT)
+int alertFreshness = input.int(4, "Maximum source age (minutes)", minval = 2, maxval = 10, group = G_ALERT, tooltip = "Reject older source minutes after reconnect. Allows for the deliberate source lag and feed delivery; verify timing in TradingView.")
+
+//@type Confirmed one-minute source state, with a deliberate one-minute publication lag.
+//@field sourceTime Opening time of the completed source minute.
+//@field scale Prior complete-session price volatility, not a reversal forecast.
+type Snapshot
+    int sourceTime
+    float price
+    float barHigh
+    float barLow
+    float tick
+    float scale
+    int samples
+    float priorHigh
+    float priorLow
+    float priorClose
+    float priorVwap
+    float overnightHigh
+    float overnightLow
+    float openingHigh
+    float openingLow
+    float vwap
+    float cashOpen
+    float efficiency
+    bool cashActive
+    float ratio
+    float basis
+    int mappingTime
+    int invalidOverrides
+
+//@type An externally supplied reference; its label does not certify positioning.
+//@field code CW, PW, ZG or PIN.
+//@field price Price in the selected underlying's units.
+type ManualLevel
+    string code
+    float price
+
+//@type A bounded union of nearby candidate prices.
+//@field reference Session extrema, range or close contributes at most one family.
+//@field benchmark Current or prior VWAP contributes at most one family.
+//@field options All manually supplied levels contribute at most one family.
+type Zone
+    float lower
+    float upper
+    float center
+    string codes
+    bool reference
+    bool benchmark
+    bool options
+    bool visible
+
+//@function Split manual input without treating a comma as a thousands separator.
+//@param text Semicolon or newline separated entries.
+//@returns Normalized entry strings.
+fEntries(string text) =>
+    str.split(str.replace_all(str.replace_all(text, "\r", ""), "\n", ";"), ";")
+
+//@function Parse a validated New York calendar date and clock.
+//@param dateText Eight digit YYYYMMDD date.
+//@param clockText Four digit HHMM clock.
+//@returns Timestamp, or na for malformed or normalized-out-of-range dates.
+fTimestamp(string dateText, string clockText) =>
+    int result = na
+    if str.length(dateText) == 8 and str.length(clockText) == 4
+        int y = int(str.tonumber(str.substring(dateText, 0, 4)))
+        int m = int(str.tonumber(str.substring(dateText, 4, 6)))
+        int d = int(str.tonumber(str.substring(dateText, 6, 8)))
+        int h = int(str.tonumber(str.substring(clockText, 0, 2)))
+        int n = int(str.tonumber(str.substring(clockText, 2, 4)))
+        if not na(y) and not na(m) and not na(d) and not na(h) and not na(n) and y >= 1970 and m >= 1 and m <= 12 and d >= 1 and d <= 31 and h >= 0 and h < 24 and n >= 0 and n < 60
+            int candidate = timestamp(TZ, y, m, d, h, n)
+            if str.format_time(candidate, "yyyyMMdd-HHmm", TZ) == dateText + "-" + clockText
+                result := candidate
+    result
+
+//@function Parse explicit cash or futures close overrides.
+//@param text YYYYMMDD=HHMM entries.
+//@returns Date-to-minute map and the rejected-entry count.
+fOverrides(string text) =>
+    map<int, int> result = map.new<int, int>()
+    int rejected = 0
+    for entry in fEntries(text)
+        string clean = str.trim(entry)
+        if clean != ""
+            array<string> pair = str.split(clean, "=")
+            bool valid = false
+            if pair.size() == 2 and result.size() < MAX_OVERRIDES
+                string dateText = str.trim(pair.get(0))
+                string clockText = str.trim(pair.get(1))
+                if not na(fTimestamp(dateText, clockText))
+                    int dateKey = int(str.tonumber(dateText))
+                    int clock = int(str.tonumber(clockText))
+                    result.put(dateKey, int(clock / 100) * 60 + clock % 100)
+                    valid := true
+            if not valid
+                rejected += 1
+    [result, rejected]
+
+//@function Return source-clock state; every returned scalar is offset one source bar.
+//@returns Snapshot usable identically on equal and higher chart timeframes.
+fSource() =>
+    var map<int, int> cashCloses = map.new<int, int>()
+    var map<int, int> futuresCloses = map.new<int, int>()
+    var int badOverrides = 0
+    if barstate.isfirst
+        [parsedCash, badCash] = fOverrides(cashOverrides)
+        [parsedFutures, badFutures] = fOverrides(futuresOverrides)
+        cashCloses := parsedCash
+        futuresCloses := parsedFutures
+        badOverrides := badCash + badFutures
+    int minuteOfDay = hour(time, TZ) * 60 + minute(time, TZ)
+    int dateKey = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+    int cashStartMinute = int(str.tonumber(str.substring(cashSession, 0, 2))) * 60 + int(str.tonumber(str.substring(cashSession, 2, 4)))
+    int cashStopMinute = int(str.tonumber(str.substring(cashSession, 5, 7))) * 60 + int(str.tonumber(str.substring(cashSession, 7, 9)))
+    int globexStartMinute = int(str.tonumber(str.substring(globexSession, 0, 2))) * 60 + int(str.tonumber(str.substring(globexSession, 2, 4)))
+    int nextDate = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ) + (minuteOfDay >= globexStartMinute ? 1 : 0), 12, 0)
+    int tradeKey = year(nextDate, TZ) * 10000 + month(nextDate, TZ) * 100 + dayofmonth(nextDate, TZ)
+    int cashEnd = cashCloses.contains(dateKey) ? cashCloses.get(dateKey) : 1440
+    int futuresEnd = futuresCloses.contains(dateKey) ? futuresCloses.get(dateKey) : 1440
+    bool inGlobex = not na(time("1", globexSession + ":1234567", TZ)) and (minuteOfDay < futuresEnd or minuteOfDay >= globexStartMinute)
+    bool inCash = inGlobex and not na(time("1", cashSession + ":23456", TZ)) and minuteOfDay < cashEnd
+    bool cashStart = inCash and (not inCash[1] or tradeKey != tradeKey[1])
+    bool newTrade = na(tradeKey[1]) or tradeKey != tradeKey[1]
+    bool manualReset = resetAt > 0 and time >= resetAt and (na(time[1]) or time[1] < resetAt)
+    bool gap = not na(time[1]) and time - time[1] != MINUTE_MS
+    var float priorHigh = na
+    var float priorLow = na
+    var float priorClose = na
+    var float priorVwap = na
+    var float variance = na
+    var array<float> varianceWindow = array.new<float>()
+    var int samples = 0
+    var float cashHigh = na
+    var float cashLow = na
+    var float cashOpen = na
+    var float cashClose = na
+    var float sumVolume = 0
+    var float sumPriceVolume = 0
+    var bool volumeComplete = false
+    var float pathLength = 0
+    var int cashCount = 0
+    var int expectedCashCount = 0
+    var int expectedCashStop = 0
+    var bool cashValid = false
+    var float overnightHigh = na
+    var float overnightLow = na
+    var bool overnightValid = false
+    var bool overnightDone = false
+    var float openingHigh = na
+    var float openingLow = na
+    var bool openingDone = false
+    var bool openingValid = false
+    var float ratio = na
+    var float basis = na
+    var int mappingTime = na
+    var bool mappingFrozen = false
+    if manualReset
+        priorHigh := na
+        priorLow := na
+        priorClose := na
+        priorVwap := na
+        variance := na
+        varianceWindow.clear()
+        samples := 0
+        cashValid := false
+        overnightValid := false
+        openingValid := false
+        ratio := na
+        basis := na
+        mappingTime := na
+    if (not inCash or cashStart) and inCash[1]
+        int lastCashMinute = hour(time[1], TZ) * 60 + minute(time[1], TZ)
+        bool complete = cashValid and cashCount == expectedCashCount and lastCashMinute == expectedCashStop - 1
+        if complete and not na(cashClose)
+            float observation = switch volMethod
+                "Parkinson" => math.pow(math.log(cashHigh / cashLow), 2) / (4 * math.log(2))
+                "Close return" => not na(priorClose) ? math.pow(math.log(cashClose / priorClose), 2) : na
+                => math.log(cashHigh / cashOpen) * math.log(cashHigh / cashClose) + math.log(cashLow / cashOpen) * math.log(cashLow / cashClose)
+            if not na(observation)
+                varianceWindow.push(math.max(observation, 0))
+                if varianceWindow.size() > volLength
+                    varianceWindow.shift()
+                variance := varianceWindow.avg()
+                samples := varianceWindow.size()
+            priorHigh := cashHigh
+            priorLow := cashLow
+            priorClose := cashClose
+            priorVwap := volumeComplete and sumVolume > 0 ? sumPriceVolume / sumVolume : na
+        else
+            priorHigh := na
+            priorLow := na
+            priorClose := na
+            priorVwap := na
+    if newTrade or manualReset
+        overnightHigh := na
+        overnightLow := na
+        overnightValid := minuteOfDay == globexStartMinute and inGlobex
+        overnightDone := false
+        openingHigh := na
+        openingLow := na
+        openingDone := false
+        openingValid := false
+    bool inOvernight = inGlobex and (minuteOfDay >= globexStartMinute or minuteOfDay < cashStartMinute)
+    if inOvernight
+        if gap and not newTrade
+            overnightValid := false
+        overnightHigh := na(overnightHigh) ? high : math.max(overnightHigh, high)
+        overnightLow := na(overnightLow) ? low : math.min(overnightLow, low)
+    if cashStart
+        overnightDone := overnightValid and not gap and inOvernight[1] and not na(overnightHigh)
+        cashHigh := high
+        cashLow := low
+        cashOpen := open
+        cashClose := close
+        sumVolume := 0
+        sumPriceVolume := 0
+        volumeComplete := true
+        pathLength := 0
+        cashCount := 0
+        expectedCashStop := math.min(cashStopMinute, cashEnd, futuresEnd)
+        expectedCashCount := expectedCashStop - cashStartMinute
+        cashValid := minuteOfDay == cashStartMinute
+        openingHigh := na
+        openingLow := na
+        openingValid := cashValid
+        openingDone := false
+        mappingFrozen := false
+    if inCash
+        if gap and not cashStart
+            cashValid := false
+            if not openingDone
+                openingValid := false
+        cashHigh := math.max(cashHigh, high)
+        cashLow := math.min(cashLow, low)
+        cashClose := close
+        cashCount += 1
+        pathLength += math.abs(close - (cashStart ? open : close[1]))
+        if not na(volume) and volume > 0
+            sumVolume += volume
+            sumPriceVolume += hlc3 * volume
+        if na(volume) or volume < 0
+            volumeComplete := false
+        if minuteOfDay < cashStartMinute + openingMinutes
+            openingHigh := na(openingHigh) ? high : math.max(openingHigh, high)
+            openingLow := na(openingLow) ? low : math.min(openingLow, low)
+        else if not openingDone and openingValid
+            openingDone := true
+    if showOptions and optionUnits != "Native"
+        [indexClose, indexTime] = request.security(indexSymbol, "1", [close, time], gaps = barmerge.gaps_on, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+        [etfClose, etfTime] = request.security(etfSymbol, "1", [close, time], gaps = barmerge.gaps_on, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+        bool synchronized = inCash and indexTime == time and indexClose > 0 and (optionUnits == "NDX / index" or etfTime == time and etfClose > 0)
+        if synchronized and (not mappingFrozen or conversionMode == "Update each cash minute")
+            ratio := optionUnits == "QQQ / ETF" ? indexClose / etfClose : 1
+            basis := close - indexClose
+            mappingTime := time
+            mappingFrozen := true
+    float scale = samples >= volLength and not na(priorClose) ? priorClose * math.sqrt(variance) : na
+    float vwap = inCash and cashValid and volumeComplete and sumVolume > 0 ? sumPriceVolume / sumVolume : na
+    float efficiency = inCash and cashValid and cashCount >= regimeMinutes and pathLength > 0 ? math.abs(close - cashOpen) / pathLength : na
+    Snapshot.new(time[1], close[1], high[1], low[1], syminfo.mintick, scale[1], samples[1], priorHigh[1], priorLow[1], priorClose[1], priorVwap[1], overnightDone[1] ? overnightHigh[1] : na, overnightDone[1] ? overnightLow[1] : na, openingDone[1] ? openingHigh[1] : na, openingDone[1] ? openingLow[1] : na, vwap[1], inCash[1] ? cashOpen[1] : na, efficiency[1], inCash[1], ratio[1], basis[1], mappingTime[1], badOverrides)
+
+//@function Check a family's chart visibility without changing source calculations.
+//@param periods Comma-separated minute periods.
+//@returns True when the current chart period is present.
+fVisible(string periods) =>
+    str.contains("," + str.replace_all(periods, " ", "") + ",", "," + timeframe.period + ",")
+
+//@function Count distinct mechanism families, without treating count as probability.
+//@param zone Candidate or merged zone.
+//@returns Integer in [1, 3].
+fStrength(Zone zone) =>
+    (zone.reference ? 1 : 0) + (zone.benchmark ? 1 : 0) + (zone.options ? 1 : 0)
+
+//@function Insert a tick-aligned candidate into ascending price order.
+//@param zones Mutable candidate list.
+//@param price Native contract price.
+//@param code Short source abbreviation.
+//@param family One for references, two for benchmarks, three for options.
+//@param visible Visibility only; does not change merging or family counts.
+//@param state Confirmed source snapshot.
+//@returns Nothing meaningful; mutates zones.
+fAdd(array<Zone> zones, float price, string code, int family, bool visible, Snapshot state) =>
+    if not na(price) and price > 0 and math.abs(price - state.price) <= distanceSigma * state.scale
+        float center = math.round(price / state.tick) * state.tick
+        float width = math.max(state.tick, state.scale * halfWidthSigma)
+        float lower = math.floor((center - width) / state.tick) * state.tick
+        float upper = math.ceil((center + width) / state.tick) * state.tick
+        Zone candidate = Zone.new(lower, upper, center, code, family == 1, family == 2, family == 3, visible)
+        int index = 0
+        while index < zones.size() and zones.get(index).center < center
+            index += 1
+        zones.insert(index, candidate)
+
+//@function Build bounded confluence zones, then retain the nearest eligible zones.
+//@param state Confirmed source snapshot.
+//@param manual Parsed external references.
+//@returns Eligible zones ordered by distance, independent of chart OHLC.
+fZones(Snapshot state, array<ManualLevel> manual) =>
+    array<Zone> candidates = array.new<Zone>()
+    array<Zone> merged = array.new<Zone>()
+    array<Zone> result = array.new<Zone>()
+    if not na(state.scale) and state.scale > 0
+        if showPrior
+            fAdd(candidates, state.priorHigh, "PDH", 1, fVisible(priorTf), state)
+            fAdd(candidates, state.priorLow, "PDL", 1, fVisible(priorTf), state)
+            fAdd(candidates, state.priorClose, "PCC", 1, fVisible(priorTf), state)
+        if showOvernight
+            fAdd(candidates, state.overnightHigh, "ONH", 1, fVisible(overnightTf), state)
+            fAdd(candidates, state.overnightLow, "ONL", 1, fVisible(overnightTf), state)
+        if showOpening
+            fAdd(candidates, state.openingHigh, "ORH", 1, fVisible(openingTf), state)
+            fAdd(candidates, state.openingLow, "ORL", 1, fVisible(openingTf), state)
+        if showVwap
+            fAdd(candidates, state.vwap, "VW", 2, fVisible(vwapTf), state)
+        if showPriorVwap
+            fAdd(candidates, state.priorVwap, "PVW", 2, fVisible(vwapTf), state)
+        bool mappingValid = not na(state.mappingTime) and state.sourceTime >= state.mappingTime and state.sourceTime - state.mappingTime <= mappingHours * 60 * MINUTE_MS
+        if showOptions
+            for entry in manual
+                float price = optionUnits == "Native" ? entry.price : mappingValid ? entry.price * state.ratio + state.basis : na
+                fAdd(candidates, price, entry.code, 3, fVisible(optionsTf), state)
+        float cap = math.max(2 * state.tick, state.scale * maximumWidthSigma)
+        for candidate in candidates
+            if candidate.upper - candidate.lower <= cap
+                bool join = false
+                if merged.size() > 0
+                    Zone last = merged.last()
+                    float combinedLower = math.min(last.lower, candidate.lower)
+                    float combinedUpper = math.max(last.upper, candidate.upper)
+                    join := math.abs(candidate.center - last.center) <= mergeSigma * state.scale and combinedUpper - combinedLower <= cap
+                    if join
+                        last.lower := combinedLower
+                        last.upper := combinedUpper
+                        last.center := math.round((combinedLower + combinedUpper) / (2 * state.tick)) * state.tick
+                        last.codes += "/" + candidate.codes
+                        last.reference := last.reference or candidate.reference
+                        last.benchmark := last.benchmark or candidate.benchmark
+                        last.options := last.options or candidate.options
+                        last.visible := last.visible or candidate.visible
+                if not join
+                    merged.push(candidate)
+        bool directional = not na(state.efficiency) and state.efficiency >= highEfficiency or dealerRegime == "Negative"
+        for zone in merged
+            bool isolatedBenchmark = zone.benchmark and not zone.reference and not zone.options
+            if zone.visible and fStrength(zone) >= minimumStrength and not (hideDirectionalVwap and directional and isolatedBenchmark)
+                int index = 0
+                while index < result.size() and math.abs(result.get(index).center - state.price) <= math.abs(zone.center - state.price)
+                    index += 1
+                result.insert(index, zone)
+        while result.size() > maximumZones
+            result.pop()
+    result
+
+//@function Identify a manual event window without adding directional bias.
+//@param sourceTime Opening time of a confirmed minute.
+//@param events Explicit event timestamps.
+//@returns Whether that minute overlaps a configured blackout window.
+fEvent(int sourceTime, array<int> events) =>
+    bool active = false
+    for eventTime in events
+        active := active or sourceTime + MINUTE_MS > eventTime - minutesBefore * MINUTE_MS and sourceTime <= eventTime + minutesAfter * MINUTE_MS
+    active
+
+//@function Format native prices at the chart instrument's tick precision.
+//@param price Native price or na.
+//@returns Short display text.
+fPrice(float price) =>
+    na(price) ? "—" : str.tostring(price, format.mintick)
+
+bool continuousChart = str.contains(syminfo.ticker, "!")
+string inferredSource = continuousChart ? syminfo.current_contract : syminfo.tickerid
+string selectedSource = sourceInput == "" ? inferredSource : sourceInput
+if barstate.isfirst
+    if not timeframe.isminutes or not fVisible(ALL_TF)
+        runtime.error("Use a standard 1, 5, 10, 15, 60 or 240 minute chart.")
+    if not chart.is_standard
+        runtime.error("Use standard candles; synthetic chart prices are not valid source observations.")
+    if na(selectedSource) or selectedSource == "" or str.contains(selectedSource, "!")
+        runtime.error("Select a dated futures contract as Source contract; no continuous-contract history is used.")
+    if highEfficiency <= lowEfficiency or maximumWidthSigma < 2 * halfWidthSigma
+        runtime.error("High efficiency must exceed low efficiency; maximum width must be at least twice half-width.")
+string sourceTicker = ticker.modify(selectedSource, session = session.extended, backadjustment = backadjustment.off, settlement_as_close = settlement_as_close.off)
+array<Snapshot> sourceStates = request.security_lower_tf(sourceTicker, "1", fSource(), calc_bars_count = sourceBars)
+var array<ManualLevel> manualLevels = array.new<ManualLevel>()
+var array<int> eventTimes = array.new<int>()
+var int badManual = 0
+var int badEvents = 0
+if barstate.isfirst
+    for entry in fEntries(manualText)
+        string clean = str.trim(entry)
+        if clean != ""
+            array<string> pair = str.split(clean, ":")
+            bool valid = false
+            if pair.size() == 2 and manualLevels.size() < MAX_MANUAL
+                string code = str.upper(str.trim(pair.get(0)))
+                float price = str.tonumber(str.trim(pair.get(1)))
+                if (code == "CW" or code == "PW" or code == "ZG" or code == "PIN") and not na(price) and price > 0
+                    manualLevels.push(ManualLevel.new(code, price))
+                    valid := true
+            if not valid
+                badManual += 1
+    for entry in fEntries(eventText)
+        string clean = str.trim(entry)
+        if clean != ""
+            int eventTime = str.length(clean) == 13 and str.substring(clean, 8, 9) == "-" ? fTimestamp(str.substring(clean, 0, 8), str.substring(clean, 9, 13)) : na
+            if not na(eventTime) and eventTimes.size() < MAX_EVENTS
+                eventTimes.push(eventTime)
+            else
+                badEvents += 1
+
+var array<box> zoneBoxes = array.new<box>()
+var array<line> zoneLines = array.new<line>()
+var array<label> zoneLabels = array.new<label>()
+string extension = extensionInput == "Both" ? extend.both : extensionInput == "Right" ? extend.right : extend.none
+string lineStyle = lineStyleInput == "Dashed" ? line.style_dashed : lineStyleInput == "Dotted" ? line.style_dotted : line.style_solid
+string labelSize = labelSizeInput == "Tiny" ? size.tiny : labelSizeInput == "Normal" ? size.normal : size.small
+string tableLocation = switch tablePosition
+    "Top left" => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left" => position.bottom_left
+    => position.top_right
+var table info = table.new(tableLocation, 2, 10, bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, TABLE_FRAME_TRANSPARENCY), frame_width = 1)
+varip int lastSeenSource = na
+varip int lastAlertTime = na
+varip Snapshot priorAlertState = na
+var Snapshot displayedState = na
+if sourceStates.size() > 0
+    Snapshot candidateState = sourceStates.last()
+    if not na(candidateState.sourceTime) and (na(displayedState) or candidateState.sourceTime >= displayedState.sourceTime)
+        displayedState := candidateState
+if barstate.isrealtime and sourceStates.size() > 0
+    for state in sourceStates
+        if not na(state.sourceTime) and (na(lastSeenSource) or state.sourceTime > lastSeenSource)
+            bool fresh = timenow >= state.sourceTime + MINUTE_MS and timenow - state.sourceTime <= alertFreshness * MINUTE_MS
+            bool allowed = enableAlerts and fresh and (na(lastAlertTime) or state.sourceTime - lastAlertTime >= alertCooldown * MINUTE_MS) and not (muteEvents and fEvent(state.sourceTime, eventTimes))
+            bool consecutive = not na(priorAlertState) and state.sourceTime - priorAlertState.sourceTime == MINUTE_MS
+            if allowed and consecutive
+                for zone in fZones(priorAlertState, manualLevels)
+                    bool touched = state.barLow <= zone.upper and state.barHigh >= zone.lower
+                    bool entered = priorAlertState.price < zone.lower or priorAlertState.price > zone.upper
+                    if touched and entered and fStrength(zone) >= alertStrength
+                        alert(syminfo.ticker + " " + zone.codes + " " + fPrice(zone.lower) + "–" + fPrice(zone.upper) + " | families=" + str.tostring(fStrength(zone)) + " | source=" + str.format_time(state.sourceTime, "yyyy-MM-dd HH:mm", TZ) + " NY", alert.freq_all)
+                        lastAlertTime := state.sourceTime
+                        break
+            lastSeenSource := state.sourceTime
+            priorAlertState := state
+
+if barstate.islast
+    while zoneBoxes.size() < maximumZones
+        zoneBoxes.push(box.new(na, na, na, na, xloc = xloc.bar_time, border_width = 0))
+        zoneLines.push(line.new(na, na, na, na, xloc = xloc.bar_time))
+        zoneLabels.push(label.new(na, na, "", xloc = xloc.bar_time, style = label.style_none))
+    Snapshot state = displayedState
+    array<Zone> zones = not na(state) and not na(state.sourceTime) ? fZones(state, manualLevels) : array.new<Zone>()
+    float nearestAbove = na
+    float nearestBelow = na
+    for index = 0 to maximumZones - 1
+        box area = zoneBoxes.get(index)
+        line centerLine = zoneLines.get(index)
+        label tag = zoneLabels.get(index)
+        if index < zones.size()
+            Zone zone = zones.get(index)
+            int strength = fStrength(zone)
+            bool directional = not na(state.efficiency) and state.efficiency >= highEfficiency or dealerRegime == "Negative"
+            bool dim = directional and zone.benchmark and not zone.reference and not zone.options
+            color base = zone.options or strength > 1 ? optionsColor : zone.benchmark ? benchmarkColor : referenceColor
+            int lineTransparency = int(math.min(100, math.max(0, 100 - lineOpacity - (strength - 1) * LINE_STRENGTH_OPACITY + (dim ? DIRECTIONAL_LINE_FADE : 0))))
+            int fillTransparency = int(math.min(100, math.max(0, 100 - fillOpacity - (strength - 1) * FILL_STRENGTH_OPACITY + (dim ? DIRECTIONAL_FILL_FADE : 0))))
+            int start = state.sourceTime - historyMinutes * MINUTE_MS
+            int end = state.sourceTime + MINUTE_MS
+            area.set_lefttop(start, zone.upper)
+            area.set_rightbottom(end, zone.lower)
+            area.set_bgcolor(color.new(base, fillTransparency))
+            area.set_extend(extension)
+            centerLine.set_xy1(start, zone.center)
+            centerLine.set_xy2(end, zone.center)
+            centerLine.set_color(color.new(base, lineTransparency))
+            centerLine.set_width(lineWidth + strength - 1)
+            centerLine.set_style(lineStyle)
+            centerLine.set_extend(extension)
+            tag.set_xy(labelSide == "Right" ? end + labelOffset * MINUTE_MS : start - labelOffset * MINUTE_MS, zone.center)
+            tag.set_text(showLabels ? zone.codes + " " + fPrice(zone.center) + " [" + str.tostring(strength) + "]" : "")
+            tag.set_textcolor(base)
+            tag.set_size(labelSize)
+            if zone.lower > state.price
+                nearestAbove := na(nearestAbove) ? zone.lower : math.min(nearestAbove, zone.lower)
+            if zone.upper < state.price
+                nearestBelow := na(nearestBelow) ? zone.upper : math.max(nearestBelow, zone.upper)
+        else
+            area.set_lefttop(na, na)
+            area.set_rightbottom(na, na)
+            centerLine.set_xy1(na, na)
+            centerLine.set_xy2(na, na)
+            tag.set_text("")
+    table.clear(info, 0, 0, 1, 9)
+    if showTable
+        string status = na(state) ? "No minute coverage" : na(state.scale) ? state.samples >= volLength ? "Incomplete session / no scale" : "Warmup " + str.tostring(state.samples) + "/" + str.tostring(volLength) : "Confirmed 1m map"
+        string regime = na(state) or na(state.efficiency) ? "Unavailable" : state.efficiency >= highEfficiency ? "Directional" : state.efficiency <= lowEfficiency ? "Low efficiency" : "Mixed"
+        string sigmaText = na(state) ? "—" : fPrice(state.scale)
+        string rangeText = not na(state) and not na(state.cashOpen) and not na(state.scale) ? fPrice(math.round((state.cashOpen - state.scale) / state.tick) * state.tick) + " / " + fPrice(math.round((state.cashOpen + state.scale) / state.tick) * state.tick) : "—"
+        string aboveText = not na(nearestAbove) ? fPrice(nearestAbove) + " (" + str.tostring((nearestAbove - state.price) / state.scale, "#.##") + "σ)" : "—"
+        string belowText = not na(nearestBelow) ? fPrice(nearestBelow) + " (" + str.tostring((state.price - nearestBelow) / state.scale, "#.##") + "σ)" : "—"
+        int rejected = badManual + badEvents + (na(state) ? 0 : state.invalidOverrides)
+        bool eventActive = not na(state) and fEvent(state.sourceTime, eventTimes)
+        string mappingText = optionUnits == "Native" ? "Native prices" : na(state) or na(state.mappingTime) ? "No synchronized map" : str.format_time(state.mappingTime, "MM-dd HH:mm", TZ) + " NY"
+        if optionUnits != "Native" and not na(state) and not na(state.mappingTime)
+            mappingText += state.sourceTime - state.mappingTime > mappingHours * 60 * MINUTE_MS ? " EXPIRED" : state.cashActive ? "" : " frozen"
+        bool oldCalendar = not na(state) and year(state.sourceTime, TZ) != CALENDAR_YEAR and cashOverrides == CASH_CALENDAR
+        string warning = rejected > 0 ? "Rejected entries: " + str.tostring(rejected) : oldCalendar ? "Update cash holiday calendar" : continuousChart ? "Current dated source; replay: select contract" : "Not a probability model"
+        array<string> keys = array.from("State", "Contract", "Source NY", "Path / gamma", "Sigma (prior data)", "Open ± sigma", "Above / below", "Conversion NY", "Event", "Note")
+        array<string> values = array.from(status, selectedSource, na(state) ? "—" : str.format_time(state.sourceTime, "MM-dd HH:mm", TZ), regime + " / " + dealerRegime, sigmaText, rangeText, aboveText + " / " + belowText, mappingText, eventActive ? "Blackout" : "No manual window", warning)
+        for row = 0 to 9
+            table.cell(info, 0, row, keys.get(row), text_color = chart.fg_color, text_size = size.small)
+            table.cell(info, 1, row, values.get(row), text_color = chart.fg_color, text_size = size.small)
