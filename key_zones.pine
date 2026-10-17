@@ -1,7 +1,7 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
 // https://mozilla.org/MPL/2.0/
 //@version=6
-indicator("Session reference zones", overlay = true, max_boxes_count = 24, max_lines_count = 24, max_labels_count = 24, dynamic_requests = true)
+indicator("Session reference zones", overlay = true, scale = scale.none, max_boxes_count = 24, max_lines_count = 24, max_labels_count = 24, dynamic_requests = true)
 
 const string TZ = "America/New_York"
 const int MINUTE_MS = 60000
@@ -25,7 +25,7 @@ const string G_ZONES = "Zones and filtering"
 const string G_STYLE = "Appearance"
 const string G_ALERT = "Alerts"
 
-string sourceInput = input.symbol("", "Source contract", group = G_DATA, tooltip = "Blank: chart contract; continuous charts use their CURRENT dated contract. For historical replay select the dated contract explicitly.")
+string sourceInput = input.symbol("", "Source contract", group = G_DATA, tooltip = "Blank: chart contract; continuous charts use their CURRENT dated contract. For past Replay, open the dated contract covering that date and leave this blank, or select that same dated source. Historical zones require enough complete source sessions before the Replay cursor.")
 int sourceBars = input.int(100000, "Source minutes", minval = 10000, maxval = 100000, step = 10000, group = G_DATA, tooltip = "Requested one-minute bars. Coverage also depends on your plan and data feed.")
 string globexSession = input.session("1800-1700", "Globex", group = G_DATA, tooltip = "New York time. Default includes the 17:00–18:00 maintenance break.")
 string cashSession = input.session("0930-1600", "Cash reference", group = G_DATA, tooltip = "New York time, Monday–Friday. Used as a reference session for futures.")
@@ -593,7 +593,7 @@ if barstate.islast
         if optionUnits != "Native" and not na(state) and not na(state.mappingTime)
             mappingText += state.sourceTime - state.mappingTime > mappingHours * 60 * MINUTE_MS ? " EXPIRED" : state.cashActive ? "" : " frozen"
         bool oldCalendar = not na(state) and year(state.sourceTime, TZ) != CALENDAR_YEAR and cashOverrides == CASH_CALENDAR
-        string warning = rejected > 0 ? "Rejected entries: " + str.tostring(rejected) : oldCalendar ? "Update cash holiday calendar" : continuousChart ? "Current dated source; replay: select contract" : "Not a probability model"
+        string warning = rejected > 0 ? "Rejected entries: " + str.tostring(rejected) : oldCalendar ? "Update cash holiday calendar" : continuousChart and sourceInput == "" ? "Auto current contract; past Replay: select dated chart/source" : continuousChart ? "Dated source; check chart backadjustment" : "Not a probability model"
         array<string> keys = array.from("State", "Contract", "Source NY", "Path / gamma", "Sigma (prior data)", "Open ± sigma", "Above / below", "Conversion NY", "Event", "Note")
         array<string> values = array.from(status, selectedSource, na(state) ? "—" : str.format_time(state.sourceTime, "MM-dd HH:mm", TZ), regime + " / " + dealerRegime, sigmaText, rangeText, aboveText + " / " + belowText, mappingText, eventActive ? "Blackout" : "No manual window", warning)
         for row = 0 to 9

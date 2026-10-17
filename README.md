@@ -5,6 +5,7 @@ Indicateur Pine Script v6 pour NQ/MNQ et ES/MES, sur 1m/5m/10m/15m/1h/4h.
 - `key_zones.pine` : script complet à copier dans Pine Editor.
 - `AUDIT.md` : audit du code final, recherche vérifiée, contexte au 17 octobre 2026, références et limites.
 - `GUIDE.md` : installation, réglages, routine quotidienne et réception TradingView.
+- `TROUBLESHOOTING.md` : English guide to Replay coverage and zones appearing to move when zooming.
 - `validation/README.md` : comparaison hors ligne de zones contre témoins aléatoires appariés.
 - `research/` : notes sources ; le corps principal de l'audit décrit l'implémentation finale.
 
