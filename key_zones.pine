@@ -137,10 +137,10 @@ type Zone
     bool visible
 
 //@function Split manual input without treating a comma as a thousands separator.
-//@param text Semicolon or newline separated entries.
+//@param inputText Semicolon or newline separated entries.
 //@returns Normalized entry strings.
-fEntries(string text) =>
-    str.split(str.replace_all(str.replace_all(text, "\r", ""), "\n", ";"), ";")
+fEntries(string inputText) =>
+    str.split(str.replace_all(str.replace_all(inputText, "\r", ""), "\n", ";"), ";")
 
 //@function Parse a validated New York calendar date and clock.
 //@param dateText Eight digit YYYYMMDD date.
@@ -161,12 +161,12 @@ fTimestamp(string dateText, string clockText) =>
     result
 
 //@function Parse explicit cash or futures close overrides.
-//@param text YYYYMMDD=HHMM entries.
+//@param inputText YYYYMMDD=HHMM entries.
 //@returns Date-to-minute map and the rejected-entry count.
-fOverrides(string text) =>
+fOverrides(string inputText) =>
     map<int, int> result = map.new<int, int>()
     int rejected = 0
-    for entry in fEntries(text)
+    for entry in fEntries(inputText)
         string clean = str.trim(entry)
         if clean != ""
             array<string> pair = str.split(clean, "=")
